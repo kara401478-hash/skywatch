@@ -105,7 +105,7 @@ def build_figure(flights):
     max_a = max(alts) if alts else 45000
 
     def alt_color(a):
-        n = a / max_a
+        n = max(0.0, min(1.0, a / max_a))
         return f"rgb({int(n*255)},{int(n*160)},{int((1-n)*255)})"
 
     colors = [alt_color(a) for a in alts]
