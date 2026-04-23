@@ -51,6 +51,130 @@ _flights_cache = []
 _track_history = {}
 MAX_TRACK_POINTS = 60  # keep last 60 snapshots (~1 hour at 1min interval)
 
+# -- Route timetable (OpenFlights) ---------------------------------------------
+import math as _math
+
+_route_db          = {}   # key: 'IATA:SRC:DST'  -> (src, dst)
+_airport_db        = {}   # key: IATA code -> (name, lat, lon)
+_route_loaded_date = None
+
+CALLSIGN_TO_IATA = {
+    'ANA': 'NH', 'JAL': 'JL', 'SKY': 'BC', 'SFJ': '7G',
+    'ADO': 'HD', 'SNA': '6J', 'APJ': 'MM', 'JJP': 'GK',
+    'DAL': 'DL', 'UAL': 'UA', 'AAL': 'AA', 'BAW': 'BA',
+    'DLH': 'LH', 'AFR': 'AF', 'KLM': 'KL', 'SIA': 'SQ',
+    'CPA': 'CX', 'KAL': 'KE', 'AAR': 'OZ', 'CSN': 'CZ',
+    'CCA': 'CA', 'CHH': 'HU', 'UAE': 'EK', 'ETD': 'EY',
+    'QFA': 'QF', 'THY': 'TK', 'SVA': 'SV', 'RJA': 'RJ',
+}
+
+def _haversine(lat1, lon1, lat2, lon2):
+    R = 6371
+    p1, p2 = _math.radians(lat1), _math.radians(lat2)
+    dp = _math.radians(lat2 - lat1)
+    dl = _math.radians(lon2 - lon1)
+    a = _math.sin(dp/2)**2 + _math.cos(p1)*_math.cos(p2)*_math.sin(dl/2)**2
+    return 2 * R * _math.asin(_math.sqrt(a))
+
+def _load_route_db():
+    global _route_db, _airport_db, _route_loaded_date
+    today = time.strftime('%Y-%m-%d')
+    if _route_loaded_date == today and _route_db:
+        return
+    print('[Routes] Downloading OpenFlights data...')
+    try:
+        ap_resp = requests.get(
+            'https://raw.githubusercontent.com/jpatokal/openflights/master/data/airports.dat',
+            headers={'User-Agent': 'skywatch/1.0'}, timeout=15,
+        )
+        ap_resp.raise_for_status()
+        adb = {}
+        for line in ap_resp.text.splitlines():
+            p = line.split(',')
+            if len(p) < 8:
+                continue
+            iata = p[4].strip().strip('"')
+            name = p[1].strip().strip('"')
+            city = p[2].strip().strip('"')
+            try:
+                lat = float(p[6].strip().strip('"'))
+                lon = float(p[7].strip().strip('"'))
+            except ValueError:
+                continue
+            if iata and iata != r'\N' and len(iata) == 3:
+                adb[iata] = {'label': f'{city} / {name}', 'lat': lat, 'lon': lon}
+
+        rt_resp = requests.get(
+            'https://raw.githubusercontent.com/jpatokal/openflights/master/data/routes.dat',
+            headers={'User-Agent': 'skywatch/1.0'}, timeout=15,
+        )
+        rt_resp.raise_for_status()
+        rdb = {}
+        for line in rt_resp.text.splitlines():
+            p = line.split(',')
+            if len(p) < 5:
+                continue
+            airline = p[0].strip().strip('"')
+            src     = p[2].strip().strip('"')
+            dst     = p[4].strip().strip('"')
+            if airline and src and dst and len(src) == 3 and len(dst) == 3:
+                key = f'{airline}:{src}:{dst}'
+                rdb[key] = (src, dst)
+
+        _airport_db        = adb
+        _route_db          = rdb
+        _route_loaded_date = today
+        print(f'[Routes] Loaded {len(_airport_db)} airports, {len(_route_db)} routes')
+    except Exception as e:
+        print(f'[Routes] Download failed: {e}')
+
+
+def lookup_route(callsign, cur_lat, cur_lon):
+    if not callsign or len(callsign) < 4 or cur_lat is None:
+        return None
+    _load_route_db()
+    if not _route_db or not _airport_db:
+        return None
+
+    prefix = callsign[:3].upper()
+    iata   = CALLSIGN_TO_IATA.get(prefix)
+    if not iata:
+        return None
+
+    # Step1: 現在地から最近傍空港（出発地候補）
+    nearest_iata = None
+    nearest_dist = float('inf')
+    for ap_iata, ap in _airport_db.items():
+        d = _haversine(cur_lat, cur_lon, ap['lat'], ap['lon'])
+        if d < nearest_dist:
+            nearest_dist = d
+            nearest_iata = ap_iata
+
+    if not nearest_iata:
+        return None
+
+    # Step2: airline:nearest -> 目的地を探す
+    candidates = [(s, d) for k, (s, d) in _route_db.items()
+                  if k.startswith(f'{iata}:{nearest_iata}:')]
+    if not candidates:
+        # 最近傍が目的地の可能性も考慮し200km圏内の空港でリトライ
+        near_airports = [ap_iata for ap_iata, ap in _airport_db.items()
+                         if _haversine(cur_lat, cur_lon, ap['lat'], ap['lon']) < 200]
+        for ap_iata in near_airports:
+            candidates = [(s, d) for k, (s, d) in _route_db.items()
+                          if k.startswith(f'{iata}:{ap_iata}:')]
+            if candidates:
+                nearest_iata = ap_iata
+                break
+
+    if not candidates:
+        return None
+
+    src, dst = candidates[0]
+    src_label = _airport_db.get(src, {}).get('label', src)
+    dst_label = _airport_db.get(dst, {}).get('label', dst)
+    return src_label, dst_label
+
 def fetch_states():
     global _flights_cache
     token = get_token()
@@ -139,13 +263,12 @@ def fetch_aircraft_photo(icao24):
         photos = data.get("photos", [])
         if photos:
             p = photos[0]
+            ac = p.get("aircraft", {})
+            model = ac.get("model", "").strip() or ac.get("equip", "").strip() or ac.get("reg", "").strip()
             result = {
-                "url":          p.get("link", ""),
-                "thumbnail":    p.get("thumbnail", {}).get("src", ""),
-                "large":        p.get("thumbnail_large", {}).get("src", "") or p.get("thumbnail", {}).get("src", ""),
-                "photographer": p.get("photographer", "Unknown"),
-                "aircraft":     p.get("aircraft", {}).get("model", ""),
-                "airline":      p.get("airline", {}).get("name", ""),
+                "large":    p.get("thumbnail_large", {}).get("src", "") or p.get("thumbnail", {}).get("src", ""),
+                "aircraft": model,
+                "airline":  p.get("airline", {}).get("name", ""),
             }
         else:
             result = None
@@ -252,6 +375,9 @@ def build_main_figure(flights, tracked_icao=None):
             showcountries=True,  countrycolor="rgba(255,255,255,0.07)",
             showcoastlines=True, coastlinecolor="rgba(255,255,255,0.15)",
             showframe=False,     bgcolor="#060d17",
+            projection_scale=1.2,
+            lataxis=dict(range=[-65, 85]),
+            lonaxis=dict(range=[-180, 180]),
         ),
         paper_bgcolor="#060d17",
         margin=dict(l=0, r=0, t=0, b=0),
@@ -410,9 +536,15 @@ app.layout = html.Div(
             html.Div(style={"display":"flex","alignItems":"center","justifyContent":"space-between","marginBottom":"6px"}, children=[
                 html.Div(id="track-header", style={"fontSize":"12px","color":"#ffd700","letterSpacing":"1px"},
                          children="▲ 地図の飛行機をクリックすると追跡開始"),
-                html.Button("× STOP TRACKING", id="btn-stop-track",
-                    style={"backgroundColor":"transparent","color":"#4a6fa5","border":"1px solid rgba(255,255,255,0.1)",
-                           "borderRadius":"4px","padding":"3px 10px","fontSize":"10px","cursor":"pointer"}),
+                html.Div(style={"display":"flex","gap":"8px"}, children=[
+                    html.Button("× STOP TRACKING", id="btn-stop-track",
+                        style={"backgroundColor":"transparent","color":"#4a6fa5","border":"1px solid rgba(255,255,255,0.1)",
+                               "borderRadius":"4px","padding":"3px 10px","fontSize":"10px","cursor":"pointer"}),
+                    html.Button("🗺 MAP RESET", id="btn-map-reset",
+                        style={"backgroundColor":"rgba(0,200,255,0.08)","color":"#00d2d3",
+                               "border":"1px solid rgba(0,200,255,0.2)",
+                               "borderRadius":"4px","padding":"3px 10px","fontSize":"10px","cursor":"pointer"}),
+                ]),
             ]),
             # グラフ + 写真 横並び
             html.Div(style={"display":"flex","gap":"20px","alignItems":"flex-start"}, children=[
@@ -477,6 +609,7 @@ app.layout = html.Div(
         dcc.Store(id="last-refresh-ts",   data=time.time()),
         dcc.Store(id="filtered-flights",  data=[]),
         dcc.Store(id="tracked-icao",      data=None),
+        dcc.Store(id="map-reset-trigger", data=0),
     ]
 )
 
@@ -515,13 +648,14 @@ def handle_click(click_data, stop_clicks, current_icao):
     Input("interval",          "n_intervals"),
     Input("btn-filter",        "n_clicks"),
     Input("btn-reset",         "n_clicks"),
+    Input("btn-map-reset",     "n_clicks"),
     Input("tracked-icao",      "data"),
     State("filter-country",    "value"),
     State("alt-min",           "value"),
     State("alt-max",           "value"),
     prevent_initial_call=False,
 )
-def refresh_map(n_intervals, n_filter, n_reset, tracked_icao, countries, alt_min, alt_max):
+def refresh_map(n_intervals, n_filter, n_reset, n_map_reset, tracked_icao, countries, alt_min, alt_max):
     from dash import ctx
     triggered = ctx.triggered_id
 
@@ -539,6 +673,12 @@ def refresh_map(n_intervals, n_filter, n_reset, tracked_icao, countries, alt_min
         filtered = [f for f in filtered if lo <= (f["alt"] or 0) <= hi]
 
     fig = build_main_figure(filtered, tracked_icao=tracked_icao)
+
+    # MAP RESET: uirevision を変えることでズームをデフォルトに戻す
+    if triggered == "btn-map-reset":
+        fig.update_layout(uirevision=time.time())
+    else:
+        fig.update_layout(uirevision="stable")
 
     is_demo   = all(f["country"] == "Demo" for f in flights)
     n_country = len({f["country"] for f in flights})
@@ -576,9 +716,13 @@ def update_tracking(tracked_icao, _):
         alt_str = f"{current['alt']:,} ft"     if current["alt"]      else "N/A"
         spd_str = f"{current['velocity']} kts" if current["velocity"] else "N/A"
         hdg_str = f"{current['heading']}°"     if current["heading"]  else "N/A"
+        # 路線情報を照合
+        route = lookup_route(current["callsign"], current["lat"], current["lon"])
+        route_str = f"  |  {route[0]}  ->  {route[1]}" if route else ""
         header  = (
             f"🟡 TRACKING  {current['callsign']}  ({tracked_icao.upper()})  "
             f"{arr}  |  Alt: {alt_str}  Speed: {spd_str}  Hdg: {hdg_str}  |  {current['country']}"
+            f"{route_str}"
         )
     else:
         header = f"🟡 TRACKING  {tracked_icao.upper()}  (圏外 or 着陸済み)"
@@ -602,30 +746,32 @@ def update_photo_panel(tracked_icao):
 
     photo = fetch_aircraft_photo(tracked_icao)
 
+    # callsign をキャッシュから取得
+    current = next((f for f in _flights_cache if f["icao24"] == tracked_icao), None)
+    callsign = current["callsign"] if current else tracked_icao.upper()
+
     if not photo:
         return html.Div([
             html.Div("📷", style={"fontSize":"32px","textAlign":"center","padding":"20px 0 8px"}),
-            html.Div("写真なし", style={"textAlign":"center","fontSize":"11px","color":"#4a6fa5","paddingBottom":"20px"}),
+            html.Div(callsign, style={"textAlign":"center","fontSize":"12px","color":"#e0f7fa","fontWeight":"bold"}),
+            html.Div("写真なし", style={"textAlign":"center","fontSize":"11px","color":"#4a6fa5","paddingBottom":"10px"}),
         ])
+
+    # 機体名: model > equip > callsign の順でフォールバック
+    aircraft_label = photo["aircraft"] or callsign
 
     return html.Div([
         # 写真
-        html.A(
-            html.Img(
-                src=photo["large"],
-                style={"width":"100%","display":"block","objectFit":"cover","maxHeight":"160px"},
-            ),
-            href=photo["url"],
-            target="_blank",
+        html.Img(
+            src=photo["large"],
+            style={"width":"100%","display":"block","objectFit":"cover","maxHeight":"160px"},
         ),
         # メタ情報
         html.Div(style={"padding":"8px 10px"}, children=[
-            html.Div(photo["aircraft"] or "Unknown type",
+            html.Div(aircraft_label,
                      style={"fontSize":"12px","color":"#e0f7fa","fontWeight":"bold","marginBottom":"2px"}),
             html.Div(photo["airline"] or "",
-                     style={"fontSize":"11px","color":"#7ecfee","marginBottom":"4px"}),
-            html.Div(f"📸 {photo['photographer']}",
-                     style={"fontSize":"10px","color":"#4a6fa5"}),
+                     style={"fontSize":"11px","color":"#7ecfee"}),
         ]),
     ])
 
