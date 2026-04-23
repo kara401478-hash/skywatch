@@ -122,6 +122,41 @@ def fetch_airport_flights(icao_airport, mode="arrivals"):
         return []
 
 
+_photo_cache = {}  # icao24 -> {url, photographer, thumbnail} or None
+
+def fetch_aircraft_photo(icao24):
+    """Fetch aircraft photo from Planespotters.net by ICAO24 hex."""
+    if icao24 in _photo_cache:
+        return _photo_cache[icao24]
+    try:
+        resp = requests.get(
+            f"https://api.planespotters.net/pub/photos/hex/{icao24}",
+            timeout=8,
+            headers={"User-Agent": "skywatch-flight-tracker/1.0"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        photos = data.get("photos", [])
+        if photos:
+            p = photos[0]
+            result = {
+                "url":          p.get("link", ""),
+                "thumbnail":    p.get("thumbnail", {}).get("src", ""),
+                "large":        p.get("thumbnail_large", {}).get("src", "") or p.get("thumbnail", {}).get("src", ""),
+                "photographer": p.get("photographer", "Unknown"),
+                "aircraft":     p.get("aircraft", {}).get("model", ""),
+                "airline":      p.get("airline", {}).get("name", ""),
+            }
+        else:
+            result = None
+        _photo_cache[icao24] = result
+        return result
+    except Exception as e:
+        print(f"[Photo error] {e}")
+        _photo_cache[icao24] = None
+        return None
+
+
 def _demo_flights():
     import random
     random.seed(int(time.time() / 60))
@@ -379,16 +414,30 @@ app.layout = html.Div(
                     style={"backgroundColor":"transparent","color":"#4a6fa5","border":"1px solid rgba(255,255,255,0.1)",
                            "borderRadius":"4px","padding":"3px 10px","fontSize":"10px","cursor":"pointer"}),
             ]),
-            dcc.Graph(id="track-graphs",
-                      figure=go.Figure().update_layout(
-                          paper_bgcolor="#0a1628", plot_bgcolor="#0a1628",
-                          margin=dict(l=40,r=20,t=10,b=20), height=180,
-                          annotations=[dict(text="飛行機をクリックして追跡開始",
-                                            x=0.5,y=0.5,xref="paper",yref="paper",
-                                            showarrow=False,font=dict(color="#4a6fa5",size=12))],
-                      ),
-                      config={"displayModeBar":False},
-                      style={"height":"180px"}),
+            # グラフ + 写真 横並び
+            html.Div(style={"display":"flex","gap":"20px","alignItems":"flex-start"}, children=[
+                html.Div(style={"flex":"1"}, children=[
+                    dcc.Graph(id="track-graphs",
+                        figure=go.Figure().update_layout(
+                            paper_bgcolor="#0a1628", plot_bgcolor="#0a1628",
+                            margin=dict(l=40,r=20,t=10,b=20), height=180,
+                            annotations=[dict(text="飛行機をクリックして追跡開始",
+                                              x=0.5,y=0.5,xref="paper",yref="paper",
+                                              showarrow=False,font=dict(color="#4a6fa5",size=12))],
+                        ),
+                        config={"displayModeBar":False},
+                        style={"height":"180px"}),
+                ]),
+                # 写真パネル
+                html.Div(id="aircraft-photo-panel", style={
+                    "width":"260px","minWidth":"260px",
+                    "backgroundColor":"#080f1c",
+                    "border":"1px solid rgba(255,215,0,0.15)",
+                    "borderRadius":"6px",
+                    "overflow":"hidden",
+                    "display":"flex","flexDirection":"column",
+                }),
+            ]),
         ]),
 
         # ── Airport panel ─────────────────────────────────────────────────────
@@ -538,7 +587,50 @@ def update_tracking(tracked_icao, _):
     return fig, header
 
 
-# 4. Filter count
+# 3b. Aircraft photo panel
+@callback(
+    Output("aircraft-photo-panel", "children"),
+    Input("tracked-icao",          "data"),
+)
+def update_photo_panel(tracked_icao):
+    if not tracked_icao or tracked_icao.startswith("demo"):
+        return html.Div(
+            "📷 クリックで写真を表示",
+            style={"padding":"16px","fontSize":"11px","color":"#4a6fa5",
+                   "textAlign":"center","lineHeight":"180px"},
+        )
+
+    photo = fetch_aircraft_photo(tracked_icao)
+
+    if not photo:
+        return html.Div([
+            html.Div("📷", style={"fontSize":"32px","textAlign":"center","padding":"20px 0 8px"}),
+            html.Div("写真なし", style={"textAlign":"center","fontSize":"11px","color":"#4a6fa5","paddingBottom":"20px"}),
+        ])
+
+    return html.Div([
+        # 写真
+        html.A(
+            html.Img(
+                src=photo["large"],
+                style={"width":"100%","display":"block","objectFit":"cover","maxHeight":"160px"},
+            ),
+            href=photo["url"],
+            target="_blank",
+        ),
+        # メタ情報
+        html.Div(style={"padding":"8px 10px"}, children=[
+            html.Div(photo["aircraft"] or "Unknown type",
+                     style={"fontSize":"12px","color":"#e0f7fa","fontWeight":"bold","marginBottom":"2px"}),
+            html.Div(photo["airline"] or "",
+                     style={"fontSize":"11px","color":"#7ecfee","marginBottom":"4px"}),
+            html.Div(f"📸 {photo['photographer']}",
+                     style={"fontSize":"10px","color":"#4a6fa5"}),
+        ]),
+    ])
+
+
+
 @callback(
     Output("filter-count","children"),
     Input("filtered-flights","data"),
